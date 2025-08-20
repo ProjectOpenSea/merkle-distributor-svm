@@ -17,6 +17,7 @@ no-entrypoint = []
 no-idl = []
 cpi = ["no-entrypoint"]
 default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
 [dependencies]
 anchor-lang = { workspace = true }
@@ -25,3 +26,5 @@ bytemuck = { workspace = true }
 jito-merkle-verify = { path = "../../verify" }
 solana-program = { workspace = true }
 solana-security-txt = { workspace = true }
+zeroize = { workspace = true }
+proc-macro2 = "=1.0.94"
