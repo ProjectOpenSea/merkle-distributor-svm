@@ -20,7 +20,97 @@ cargo b -r
 
 Note that for searchers and validators, not all tokens will be vested until December 7, 2024. You can check the vesting status at `https://jito.network/airdrop`.
 
-## Generating a Drop:
+## Deploying a New Distributor to Existing Program
+
+Follow these steps to deploy a new USDC distributor to the existing program at `mERKcfxMC5SqJn4Ld4BUris3WKZZ1ojjWJ3A3J5CKxv`:
+
+### Prerequisites
+1. Install Solana CLI tools: https://solana.com/docs/intro/installation
+2. Build the CLI tool: `cargo build --release`
+3. Acquire USDC tokens from the market (total amount = sum of all amounts in your CSV)
+
+### Deployment Steps
+
+1. **Create your recipients CSV file** in this format:
+   ```csv
+   pubkey,amount_unlocked,amount_locked,category
+   <recipient_pubkey_1>,<unlocked_amount>,<locked_amount>,<category>
+   <recipient_pubkey_2>,<unlocked_amount>,<locked_amount>,<category>
+   ```
+
+   ```bash
+   python generate_csv.py
+   ```
+
+2. **Generate the Merkle tree from your CSV:**
+   ```bash
+   ./target/release/cli \
+    --mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
+    --rpc-url https://api.mainnet-beta.solana.com \
+    --keypair-path  ~/.config/solana/id.json \
+    create-merkle-tree \
+    --csv-path airdrop_100k.csv \
+    --merkle-tree-path merkle_tree.json
+   ```
+
+   ```bash
+   spl-token create-account EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+   ```
+
+3. **Create the new distributor on-chain:**
+   ```bash
+   ./target/release/cli \
+      --rpc-url https://api.mainnet-beta.solana.com \
+      --keypair-path ~/.config/solana/id.json \
+      --mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
+      --program-id mERKcfxMC5SqJn4Ld4BUris3WKZZ1ojjWJ3A3J5CKxv \
+      --airdrop-version 422 \ # a unique version (identifier)
+      new-distributor \
+      --clawback-receiver-token-account CZZZeKxrQRPjwAA7REZWqsADChFY7P41K2wNmRWT779U \
+      --start-vesting-ts 1756239698 \
+      --end-vesting-ts 1756239699 \
+      --clawback-start-ts 1756329899 \
+      --merkle-tree-path merkle_tree.json
+   ```
+   
+   **Parameters:**
+   - `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` = USDC mint address (mainnet)
+   - Timestamps are Unix timestamps (seconds since epoch)  
+   - `clawback-start-ts` must be at least 1 day after `end-vesting-ts`
+   - The CLI will output the distributor vault address where you need to send tokens
+
+4. **Transfer USDC tokens to the distributor vault:**
+   
+   Get the vault address from the newDistributor program output, bottom of page:
+   https://solscan.io/tx/2iHVJ8yFAhohEYzXWUedZjji99Uhrhf5qKXzYKxaqPu7cNYg4E7LKNUWoc6GiXKWgjyBfMzJUpLYBTKjMwzwhre6
+
+   ```bash
+   spl-token transfer EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
+     <TOTAL_AMOUNT> \
+     <DISTRIBUTOR_VAULT_ADDRESS> \
+     --fund-recipient
+   ```
+   
+   **Note:** `<DISTRIBUTOR_VAULT_ADDRESS>` is printed by the previous command and `<TOTAL_AMOUNT>` is the sum of all `amount_unlocked` + `amount_locked` from your CSV.
+
+5. **Test claiming tokens (optional):**
+   ```bash
+    ./target/release/cli \
+    --rpc-url https://api.mainnet-beta.solana.com \
+    --keypair-path ~/.config/solana/id.json \
+    --mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
+    --program-id mERKcfxMC5SqJn4Ld4BUris3WKZZ1ojjWJ3A3J5CKxv \
+    --airdrop-version 422 \
+    claim \
+    --merkle-tree-path merkle_tree.json
+   ```
+
+### Important Security Notes
+- The `new_distributor` instruction is susceptible to frontrunning
+- Always verify the created distributor parameters match your expectations after the transaction succeeds
+- Double-check the vault address before transferring large amounts of USDC
+
+## Original Development Setup:
 
 0. https://solana.com/docs/intro/installation
 0. `avm install 0.30.1 && avm use 0.30.1`
