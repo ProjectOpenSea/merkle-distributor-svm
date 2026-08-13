@@ -5,9 +5,11 @@ use solana_program::{hash::hashv, pubkey::Pubkey};
 use solana_sdk::hash::Hash;
 
 use crate::csv_entry::{AirdropCategory, CsvEntry};
-pub const MINT_DECIMALS: u32 = 9;
 
-/// Represents the claim information for an account.
+/// Default decimal precision for standard USDC mints (6 decimals).
+pub const DEFAULT_USDC_DECIMALS: u32 = 6;
+
+/// Represents the claim information for an account in the Merkle tree.
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct TreeNode {
     /// Pubkey of the claimant; will be responsible for signing the claim
@@ -29,6 +31,7 @@ pub struct TreeNode {
 }
 
 impl TreeNode {
+    /// Hash the tree node data for inclusion in the Merkle tree root computation.
     pub fn hash(&self) -> Hash {
         hashv(&[
             &self.claimant.to_bytes(),
@@ -37,41 +40,35 @@ impl TreeNode {
         ])
     }
 
-    /// Return total amount of locked and unlocked amount for this claimant
+    /// Return total amount of locked and unlocked tokens for this claimant.
     pub fn total_amount(&self) -> u64 {
         self.amount_unlocked()
             .checked_add(self.amount_locked())
-            .unwrap()
+            .expect("Total token amount calculation overflowed u64")
     }
 
-    /// Get total amount of unlocked tokens for this claimant
+    /// Get total amount of unlocked tokens for this claimant.
     pub fn amount_unlocked(&self) -> u64 {
         self.total_unlocked_searcher
             .checked_add(self.total_unlocked_validator)
-            .unwrap()
+            .expect("Unlocked amount addition overflowed u64")
             .checked_add(self.total_unlocked_staker)
-            .unwrap()
+            .expect("Unlocked amount addition overflowed u64")
     }
 
-    /// Get total amount of locked tokens for this claimant
+    /// Get total amount of locked tokens for this claimant.
     pub fn amount_locked(&self) -> u64 {
         self.total_locked_searcher
             .checked_add(self.total_locked_validator)
-            .unwrap()
+            .expect("Locked amount addition overflowed u64")
             .checked_add(self.total_locked_staker)
-            .unwrap()
+            .expect("Locked amount addition overflowed u64")
     }
-}
 
-/// Converts a ui amount to a token amount (with decimals)
-fn ui_amount_to_token_amount(amount: u64) -> u64 {
-    amount * 10u64.checked_pow(MINT_DECIMALS).unwrap()
-}
-
-impl From<CsvEntry> for TreeNode {
-    fn from(entry: CsvEntry) -> Self {
+    /// Construct a `TreeNode` from a `CsvEntry` using explicit token decimal precision.
+    pub fn from_csv_entry(entry: CsvEntry, decimals: u32) -> Self {
         let mut node = Self {
-            claimant: Pubkey::from_str(entry.pubkey.as_str()).unwrap(),
+            claimant: Pubkey::from_str(entry.pubkey.as_str()).expect("Invalid claimant pubkey in CSV"),
             proof: None,
             total_unlocked_staker: 0,
             total_locked_staker: 0,
@@ -81,9 +78,10 @@ impl From<CsvEntry> for TreeNode {
             total_locked_validator: 0,
         };
 
-        // CSV entry uses UI amounts; we convert to native amounts here
-        let amount_unlocked = ui_amount_to_token_amount(entry.amount_unlocked);
-        let amount_locked = ui_amount_to_token_amount(entry.amount_locked);
+        // CSV entry uses UI amounts; convert to native base units using specified decimals.
+        let amount_unlocked = ui_amount_to_token_amount(entry.amount_unlocked, decimals);
+        let amount_locked = ui_amount_to_token_amount(entry.amount_locked, decimals);
+
         match entry.category {
             AirdropCategory::Staker => {
                 node.total_unlocked_staker = amount_unlocked;
@@ -99,6 +97,24 @@ impl From<CsvEntry> for TreeNode {
             }
         }
         node
+    }
+}
+
+/// Converts a UI token amount to a native token base unit amount using target decimals.
+/// Employs checked arithmetic to prevent potential overflow attacks.
+pub fn ui_amount_to_token_amount(amount: u64, decimals: u32) -> u64 {
+    let multiplier = 10u64
+        .checked_pow(decimals)
+        .expect("Decimal exponentiation overflowed u64");
+    amount
+        .checked_mul(multiplier)
+        .expect("UI amount conversion multiplied by decimals overflowed u64")
+}
+
+impl From<CsvEntry> for TreeNode {
+    /// Default fallback conversion assuming USDC decimal precision (6 decimals).
+    fn from(entry: CsvEntry) -> Self {
+        Self::from_csv_entry(entry, DEFAULT_USDC_DECIMALS)
     }
 }
 
@@ -126,7 +142,13 @@ mod tests {
     #[test]
     fn test_ui_amount_to_token_amount() {
         let ui_amount = 5;
-        let token_amount = ui_amount_to_token_amount(ui_amount);
-        assert_eq!(token_amount, 5_000_000_000);
+
+        // Test USDC 6-decimal scaling (5 USDC -> 5_000_000 base units)
+        let usdc_amount = ui_amount_to_token_amount(ui_amount, 6);
+        assert_eq!(usdc_amount, 5_000_000);
+
+        // Test 9-decimal scaling for legacy tokens (5 SOL -> 5_000_000_000 base units)
+        let legacy_amount = ui_amount_to_token_amount(ui_amount, 9);
+        assert_eq!(legacy_amount, 5_000_000_000);
     }
 }
