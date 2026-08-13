@@ -80,7 +80,7 @@ pub fn get_routes(state: Arc<RouterState>, enable_proof_endpoint: bool) -> Route
         .route("/status/:user_pubkey", get(get_status))
         .route("/version", get(get_version));
 
-    // don't enable until airdrop starts
+    // Do not enable until the airdrop officially starts
     if enable_proof_endpoint {
         router = router.route("/proof/:user_pubkey", get(get_proof));
     }
@@ -88,7 +88,7 @@ pub fn get_routes(state: Arc<RouterState>, enable_proof_endpoint: bool) -> Route
     router.layer(middleware).with_state(state)
 }
 
-/// Retrieve the proof for a given user
+/// Retrieve the cryptographic inclusion proof for a given user
 #[instrument(ret)]
 async fn get_proof(
     State(state): State<Arc<RouterState>>,
@@ -113,7 +113,7 @@ async fn get_proof(
     Ok(Json(proof))
 }
 
-/// Get the claim status account for the user, if it doesn't exist then Unclaimed
+/// Get the claim status account for the user; defaults to Unclaimed if it does not exist on-chain.
 #[instrument(skip(state, node), ret, err)]
 async fn get_claim_status(
     state: &RouterState,
@@ -128,9 +128,6 @@ async fn get_claim_status(
         .get_multiple_accounts(&[claim_status_pda, state.distributor_pubkey])
         .await?;
 
-    // Note: this method will return an error if the distributor isn't on-chain, even if the TreeNode exists.
-    // This may happen in situations where one is previewing the airdrop amounts, but hasn't finalized the distributor on-chain.
-    // TODO (LB): is that okay behavior?
     let distributor_account = accounts
         .pop()
         .ok_or_else(|| ApiError::InternalError)?
@@ -143,13 +140,21 @@ async fn get_claim_status(
 
     let claim_status_account = accounts.pop().ok_or_else(|| ApiError::InternalError)?;
 
+    // Helper closure to safely get current UNIX timestamp without panicking on system time anomalies
+    let get_current_timestamp = || -> Result<i64> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .map_err(|_| ApiError::InternalError)
+    };
+
     if distributor.clawed_back {
         match claim_status_account {
             Some(claim_status_account) => {
                 match MerkleDistributorClaimStatus::try_deserialize(
                     &mut claim_status_account.data.as_slice(),
                 ) {
-                    // claimed some, but its expired now, so no more locked funds can be withdrawn
+                    // Already claimed some, but now expired; no more locked funds can be withdrawn
                     Ok(claim_status) => Ok(ClaimStatus {
                         status: Status::Expired,
                         total_unlocked_staker: node.total_unlocked_staker,
@@ -158,11 +163,10 @@ async fn get_claim_status(
                         total_locked_searcher: node.total_locked_searcher,
                         total_unlocked_validator: node.total_unlocked_validator,
                         total_locked_validator: node.total_locked_validator,
-                        amount_locked_withdrawable: 0, // expired, too bad
+                        amount_locked_withdrawable: 0,
                         amount_locked_withdrawn: claim_status.locked_amount_withdrawn,
                     }),
-                    // account parsing error, assume they didn't claim.
-                    // let them know what could have been but it's expired
+                    // Parse error, assume un-claimed but expired
                     Err(e) => {
                         warn!("error reading ClaimStatus: {:?}", e);
                         Ok(ClaimStatus {
@@ -173,13 +177,13 @@ async fn get_claim_status(
                             total_locked_searcher: node.total_locked_searcher,
                             total_unlocked_validator: node.total_unlocked_validator,
                             total_locked_validator: node.total_locked_validator,
-                            amount_locked_withdrawable: 0, // expired, too bad
-                            amount_locked_withdrawn: 0, /* never withdrew any because account doesn't exist */
+                            amount_locked_withdrawable: 0,
+                            amount_locked_withdrawn: 0,
                         })
                     }
                 }
             }
-            // never claimed, let them know what could have been but it's expired now
+            // Never claimed and now expired
             None => Ok(ClaimStatus {
                 status: Status::Expired,
                 total_unlocked_staker: node.total_unlocked_staker,
@@ -198,30 +202,54 @@ async fn get_claim_status(
                 match MerkleDistributorClaimStatus::try_deserialize(
                     &mut claim_status_account.data.as_slice(),
                 ) {
-                    // claimed, but might still have some locked tokens
-                    Ok(claim_status) => Ok(ClaimStatus {
-                        status: Status::Claimed,
-                        total_unlocked_staker: node.total_unlocked_staker,
-                        total_locked_staker: node.total_locked_staker,
-                        total_unlocked_searcher: node.total_unlocked_searcher,
-                        total_locked_searcher: node.total_locked_searcher,
-                        total_unlocked_validator: node.total_unlocked_validator,
-                        total_locked_validator: node.total_locked_validator,
-                        amount_locked_withdrawable: claim_status
+                    // Claimed, but might still have withdrawable locked tokens
+                    Ok(claim_status) => {
+                        let current_ts = get_current_timestamp()?;
+                        let withdrawable = claim_status
                             .amount_withdrawable(
-                                SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs() as i64,
+                                current_ts,
                                 distributor.start_ts,
                                 distributor.end_ts,
                             )
-                            .unwrap(),
-                        amount_locked_withdrawn: claim_status.locked_amount_withdrawn,
-                    }),
-                    // error parsing account, assume didn't claim. might have locked tokens too, so simulate the amount withdrawable
+                            .map_err(|_| ApiError::InternalError)?;
+
+                        Ok(ClaimStatus {
+                            status: Status::Claimed,
+                            total_unlocked_staker: node.total_unlocked_staker,
+                            total_locked_staker: node.total_locked_staker,
+                            total_unlocked_searcher: node.total_unlocked_searcher,
+                            total_locked_searcher: node.total_locked_searcher,
+                            total_unlocked_validator: node.total_unlocked_validator,
+                            total_locked_validator: node.total_locked_validator,
+                            amount_locked_withdrawable: withdrawable,
+                            amount_locked_withdrawn: claim_status.locked_amount_withdrawn,
+                        })
+                    }
+                    // Parse error, simulate status as Unclaimed to calculate potential withdrawable amounts safely
                     Err(e) => {
                         warn!("error reading ClaimStatus: {:?}", e);
+                        let total_locked = node
+                            .total_locked_staker
+                            .checked_add(node.total_locked_searcher)
+                            .ok_or(ApiError::InternalError)?
+                            .checked_add(node.total_locked_validator)
+                            .ok_or(ApiError::InternalError)?;
+
+                        let simulated_status = MerkleDistributorClaimStatus {
+                            locked_amount: total_locked,
+                            locked_amount_withdrawn: 0,
+                            ..MerkleDistributorClaimStatus::default()
+                        };
+
+                        let current_ts = get_current_timestamp()?;
+                        let withdrawable = simulated_status
+                            .amount_withdrawable(
+                                current_ts,
+                                distributor.start_ts,
+                                distributor.end_ts,
+                            )
+                            .map_err(|_| ApiError::InternalError)?;
+
                         Ok(ClaimStatus {
                             status: Status::Unclaimed,
                             total_unlocked_staker: node.total_unlocked_staker,
@@ -230,34 +258,36 @@ async fn get_claim_status(
                             total_locked_searcher: node.total_locked_searcher,
                             total_unlocked_validator: node.total_unlocked_validator,
                             total_locked_validator: node.total_locked_validator,
-                            amount_locked_withdrawable: MerkleDistributorClaimStatus {
-                                locked_amount: node
-                                    .total_locked_staker
-                                    .checked_add(node.total_locked_searcher)
-                                    .unwrap()
-                                    .checked_add(node.total_locked_validator)
-                                    .unwrap(),
-                                // haven't claimed yet, so none withdrawn
-                                locked_amount_withdrawn: 0,
-                                // the rest of the fields don't matter
-                                ..MerkleDistributorClaimStatus::default()
-                            }
-                            .amount_withdrawable(
-                                SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs() as i64,
-                                distributor.start_ts,
-                                distributor.end_ts,
-                            )
-                            .unwrap(),
-                            amount_locked_withdrawn: 0, /* never withdrew any because account doesn't exist */
+                            amount_locked_withdrawable: withdrawable,
+                            amount_locked_withdrawn: 0,
                         })
                     }
                 }
             }
             None => {
-                // haven't claimed yet. might have some claimable tokens
+                // Never claimed; evaluate potential claimable/locked amounts
+                let total_locked = node
+                    .total_locked_staker
+                    .checked_add(node.total_locked_searcher)
+                    .ok_or(ApiError::InternalError)?
+                    .checked_add(node.total_locked_validator)
+                    .ok_or(ApiError::InternalError)?;
+
+                let simulated_status = MerkleDistributorClaimStatus {
+                    locked_amount: total_locked,
+                    locked_amount_withdrawn: 0,
+                    ..MerkleDistributorClaimStatus::default()
+                };
+
+                let current_ts = get_current_timestamp()?;
+                let withdrawable = simulated_status
+                    .amount_withdrawable(
+                        current_ts,
+                        distributor.start_ts,
+                        distributor.end_ts,
+                    )
+                    .map_err(|_| ApiError::InternalError)?;
+
                 Ok(ClaimStatus {
                     status: Status::Unclaimed,
                     total_unlocked_staker: node.total_unlocked_staker,
@@ -266,46 +296,24 @@ async fn get_claim_status(
                     total_locked_searcher: node.total_locked_searcher,
                     total_unlocked_validator: node.total_unlocked_validator,
                     total_locked_validator: node.total_locked_validator,
-                    amount_locked_withdrawable: MerkleDistributorClaimStatus {
-                        locked_amount: node
-                            .total_locked_staker
-                            .checked_add(node.total_locked_searcher)
-                            .unwrap()
-                            .checked_add(node.total_locked_validator)
-                            .unwrap(),
-                        // haven't claimed yet, so none withdrawn
-                        locked_amount_withdrawn: 0,
-                        // the rest of the fields don't matter
-                        ..MerkleDistributorClaimStatus::default()
-                    }
-                    .amount_withdrawable(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs() as i64,
-                        distributor.start_ts,
-                        distributor.end_ts,
-                    )
-                    .unwrap(),
-                    amount_locked_withdrawn: 0, // never withdrew any because account doesn't exist
+                    amount_locked_withdrawable: withdrawable,
+                    amount_locked_withdrawn: 0,
                 })
             }
         }
     }
 }
 
-/// Fetch and deserialize merkle distributor information
+/// Fetch and deserialize merkle distributor information from RPC
 pub async fn read_distributor(
     rpc_client: &RpcClient,
     distributor: &Pubkey,
 ) -> Result<MerkleDistributor> {
-    return match rpc_client.get_account_data(distributor).await {
-        Ok(data) => {
-            return match MerkleDistributor::try_deserialize(&mut data.as_slice()) {
-                Ok(distributor) => Ok(distributor),
-                Err(e) => Err(ApiError::MerkleDistributorError(e.to_string())),
-            };
-        }
+    match rpc_client.get_account_data(distributor).await {
+        Ok(data) => match MerkleDistributor::try_deserialize(&mut data.as_slice()) {
+            Ok(distributor) => Ok(distributor),
+            Err(e) => Err(ApiError::MerkleDistributorError(e.to_string())),
+        },
         Err(e) => {
             if e.kind.to_string().contains("AccountNotFound") {
                 Err(ApiError::MerkleDistributorError(
@@ -315,7 +323,7 @@ pub async fn read_distributor(
                 Err(ApiError::RpcError(e))
             }
         }
-    };
+    }
 }
 
 #[instrument(ret)]
@@ -328,40 +336,21 @@ async fn get_users(State(state): State<Arc<RouterState>>) -> Result<impl IntoRes
 
 #[derive(Serialize, Deserialize)]
 struct Distributor {
-    /// Public key of this distributor
     pub pubkey: Pubkey,
-    /// Program ID this distributor belongs to
     pub program_id: Pubkey,
-
-    /// MerkleDistributor fields
-
-    /// Version of the airdrop
     pub version: u64,
-    /// The 256-bit merkle root.
     pub root: [u8; 32],
-    /// [Mint] of the token to be distributed.
     pub mint: Pubkey,
-    /// Token Address of the vault
     pub token_vault: Pubkey,
-    /// Maximum number of tokens that can ever be claimed from this [MerkleDistributor].
     pub max_total_claim: u64,
-    /// Maximum number of nodes in [MerkleDistributor].
     pub max_num_nodes: u64,
-    /// Total amount of tokens that have been claimed.
     pub total_amount_claimed: u64,
-    /// Number of nodes that have been claimed.
     pub num_nodes_claimed: u64,
-    /// Lockup time start (Unix Timestamp)
     pub start_ts: i64,
-    /// Lockup time end (Unix Timestamp)
     pub end_ts: i64,
-    /// Clawback start (Unix Timestamp)
     pub clawback_start_ts: i64,
-    /// Clawback receiver
     pub clawback_receiver: Pubkey,
-    /// Admin wallet
     pub admin: Pubkey,
-    /// Whether or not the distributor has been clawed back
     pub clawed_back: bool,
 }
 
@@ -387,7 +376,6 @@ async fn get_distributor(State(state): State<Arc<RouterState>>) -> Result<Json<D
     }))
 }
 
-// TODO: This endpoint is likely worth caching as we make many outbound rpc requests to retrieve the same information
 #[instrument(ret)]
 async fn get_status(
     State(state): State<Arc<RouterState>>,
@@ -403,7 +391,6 @@ async fn get_status(
     Ok(Json(get_claim_status(&state, node, &user_pubkey).await?))
 }
 
-/// Gets the current airdrop version
 #[instrument(ret)]
 async fn get_version(State(state): State<Arc<RouterState>>) -> Result<impl IntoResponse> {
     Ok(Json(
@@ -426,9 +413,9 @@ struct Proof {
 
 #[derive(Serialize, Deserialize, Debug)]
 enum Status {
-    Unclaimed, // User has not yet claimed any tokens
-    Claimed,   // User already claimed unlocked tokens
-    Expired,   // claim period has expired
+    Unclaimed,
+    Claimed,
+    Expired,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -448,7 +435,6 @@ struct ClaimStatus {
 mod tests {
     use super::*;
 
-    // Assert that serializing status to json response works as expected
     #[test]
     fn test_serialize_status() {
         let status = Status::Claimed;
